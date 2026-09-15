@@ -1,0 +1,20 @@
+{
+  "name": "synapse",
+  "version": "1.0.0",
+  "description": "Synapse — multi-exchange SMC trading bot with Telegram control, mirrored execution across Bybit/MEXC/Bitget/Weex/MT5, and a pump/dump scanner",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["trading-bot", "telegram", "smc", "crypto"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "canvas": "^3.2.3",
+    "ccxt": "^4.5.78",
+    "grammy": "^1.46.0",
+    "metaapi.cloud-sdk": "^29.3.3",
+    "pg": "^8.23.0"
+  }
+}
