@@ -63,6 +63,16 @@ function formatEngineEvent(entry) {
     case 'trade_closed':
       return `🛑 Trade closed — ${entry.symbol} (${entry.direction}) — reason: ${entry.reason}`;
 
+    case 'setup_skipped': {
+      if (entry.reason === 'htf_ranging') {
+        return `⏸️ ${entry.symbol} ${entry.direction} setup skipped — higher-timeframe bias is ranging (1D: ${entry.htf?.daily ?? '?'}, 4H: ${entry.htf?.fourHour ?? '?'})`;
+      }
+      if (entry.reason === 'ob_score_too_low') {
+        return `⏸️ ${entry.symbol} ${entry.direction} order block skipped — quality score ${entry.obScore}/100 below threshold`;
+      }
+      return `⏸️ ${entry.symbol} setup skipped — ${entry.reason}`;
+    }
+
     default:
       return null; // e.g. 'ob_not_found' — nothing worth notifying about
   }

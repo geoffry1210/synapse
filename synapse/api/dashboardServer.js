@@ -73,6 +73,7 @@ class BotControl {
         full_close: ['position_closed', 'success', 'Full take-profit, position closed'],
         sl_hit: ['stop_loss', 'error', 'Stop-loss triggered'],
         trade_closed: ['position_closed', 'warn', `Position closed: ${e.reason}`],
+        setup_skipped: ['signal', 'info', e.reason === 'htf_ranging' ? `${e.direction ?? ''} setup skipped: HTF ranging` : e.reason === 'ob_score_too_low' ? `Order block skipped: score ${e.obScore}/100` : `Setup skipped: ${e.reason}`],
       }[e.type];
       if (!map) continue;
       this.push({ type: map[0], level: map[1], symbol: e.symbol, text: map[2], ts: e.time });

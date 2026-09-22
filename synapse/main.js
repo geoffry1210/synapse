@@ -61,6 +61,10 @@ const SCAN_INTERVAL_MS = envNumber('SCAN_INTERVAL_MS', 5 * 60_000);
 const HOLD_CHECK_INTERVAL_MS = envNumber('HOLD_CHECK_INTERVAL_MS', 60 * 60_000);
 const PAPER_BALANCE = envNumber('PAPER_BALANCE', 10_000); // starting simulated balance per venue in DRY_RUN mode
 const SIGNAL_TIMEFRAME = process.env.SIGNAL_TIMEFRAME ?? '1h'; // candle interval the main engine reasons about
+const HTF_BIAS_ENABLED = process.env.HTF_BIAS_ENABLED !== 'false'; // daily+4H trend-agreement filter (htfBias.js) — was wired in engineCycle.js but never actually called with data until this fix
+const ENTRY_MODEL = process.env.ENTRY_MODEL === 'confirmation' ? 'confirmation' : 'aggressive'; // 'aggressive' = Model 1 (original). 'confirmation' = Model 2, needs a matching LTF CHoCH inside the zone too
+const MIN_OB_SCORE = envNumber('MIN_OB_SCORE', 50); // 0-100 orderblockValidator score floor
+const LTF_TIMEFRAME = process.env.LTF_TIMEFRAME ?? '15m'; // only fetched when ENTRY_MODEL=confirmation
 
 /** "BTCUSDT" -> "BTC/USDT" (ccxt's unified symbol format). Assumes a USDT-quoted pair. */
 function toCcxtSymbol(symbol) {
@@ -127,6 +131,38 @@ async function main() {
     return fetchCandlesFor(marketData.bybit, toCcxtSymbol(symbol), SIGNAL_TIMEFRAME, 200);
   }
 
+  // HTF bias (daily+4H) and, when ENTRY_MODEL=confirmation, LTF candles for
+  // Entry Model 2 — both were accepted by engineCycle.js's opts but never
+  // supplied from here, so those filters silently never ran. Cached per
+  // symbol since daily/4H structure barely changes minute to minute;
+  // refetching every 60s tick would be wasted API calls for no benefit.
+  const htfCache = new Map(); // symbol -> { daily: {data,at}, fourHour: {data,at} }
+  const HTF_DAILY_TTL_MS = 30 * 60_000;
+  const HTF_4H_TTL_MS = 5 * 60_000;
+  async function getHtfCandles(symbol) {
+    const now = Date.now();
+    const entry = htfCache.get(symbol) ?? {};
+    if (!entry.daily || now - entry.daily.at > HTF_DAILY_TTL_MS) {
+      entry.daily = { data: await fetchCandlesFor(marketData.bybit, toCcxtSymbol(symbol), '1d', 90), at: now };
+    }
+    if (!entry.fourHour || now - entry.fourHour.at > HTF_4H_TTL_MS) {
+      entry.fourHour = { data: await fetchCandlesFor(marketData.bybit, toCcxtSymbol(symbol), '4h', 180), at: now };
+    }
+    htfCache.set(symbol, entry);
+    return { daily: entry.daily.data, fourHour: entry.fourHour.data };
+  }
+
+  const ltfCache = new Map(); // symbol -> { data, at }
+  const LTF_TTL_MS = 60_000;
+  async function getLtfCandles(symbol) {
+    const now = Date.now();
+    const cached = ltfCache.get(symbol);
+    if (cached && now - cached.at <= LTF_TTL_MS) return cached.data;
+    const data = await fetchCandlesFor(marketData.bybit, toCcxtSymbol(symbol), LTF_TIMEFRAME, 200);
+    ltfCache.set(symbol, { data, at: now });
+    return data;
+  }
+
   // One SetupManager per whitelisted symbol, kept alive across ticks.
   const setupManagers = new Map(whitelist.getList().map((symbol) => [symbol, new SetupManager(symbol)]));
 
@@ -157,6 +193,19 @@ async function main() {
   async function tickSymbol(symbol) {
     try {
       const candles = await getCandles(symbol);
+
+      let htfCandles;
+      if (HTF_BIAS_ENABLED) {
+        try { htfCandles = await getHtfCandles(symbol); }
+        catch (err) { console.warn(`HTF candle fetch failed for ${symbol}, running this tick without the bias filter: ${err.message}`); }
+      }
+
+      let ltfCandles;
+      if (ENTRY_MODEL === 'confirmation') {
+        try { ltfCandles = await getLtfCandles(symbol); }
+        catch (err) { console.warn(`LTF candle fetch failed for ${symbol}, confirmation entries paused for this tick: ${err.message}`); }
+      }
+
       await runSymbolCycle(candles, {
         setupManager: setupManagers.get(symbol),
         router,
@@ -165,6 +214,11 @@ async function main() {
         telegramBot,
         venueLabel: 'multi',
         control,
+      }, {
+        htfCandles,
+        entryModel: ENTRY_MODEL,
+        minObScore: MIN_OB_SCORE,
+        ltfCandles,
       });
       control.ingestSetupLog(setupManagers.get(symbol), logSeen);
     } catch (err) {
