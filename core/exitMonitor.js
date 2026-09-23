@@ -62,20 +62,39 @@ async function processExit(setupManager, router, candle) {
 
   const symbol = setupManager.symbol;
   const direction = setup.direction;
+  const dir = direction === 'bullish' ? 1 : -1;
+  const trade = setup.trade;
+
+  // P&L uses the trigger LEVEL the bot acted on (the target/stop price
+  // itself), not the candle's close — closer to what a market order at
+  // that trigger actually fills near. Adapters don't currently report an
+  // exact fill price on a close (see closePercentage in ccxtAdapter.js),
+  // so this remains an approximation; still far better than recording
+  // null, which was the previous behavior for every single exit.
+  const realizedPnl = (exitPrice, closedSize) => (exitPrice - trade.entryPrice) * closedSize * dir;
 
   if (exitType === 'tp1_hit') {
+    const closedSize = trade.size * 0.3;
+    const pnl = realizedPnl(setup.fib.tp1, closedSize);
     await router.mirrorClosePercentage(symbol, direction, 30);
-    await router.mirrorMoveStopLoss(symbol, setup.trade.entryPrice);
-    setupManager.onTradeEvent('tp1_hit', {});
+    await router.mirrorMoveStopLoss(symbol, trade.entryPrice);
+    setupManager.onTradeEvent('tp1_hit', { closedSize, pnl });
   } else if (exitType === 'tp2_hit') {
+    const closedSize = trade.remainingSize * 0.3;
+    const pnl = realizedPnl(setup.fib.tp2, closedSize);
     await router.mirrorClosePercentage(symbol, direction, 30);
-    setupManager.onTradeEvent('tp2_hit', {});
+    setupManager.onTradeEvent('tp2_hit', { closedSize, pnl });
   } else if (exitType === 'full_close') {
+    const closedSize = trade.remainingSize;
+    const pnl = realizedPnl(setup.fib.tpFull, closedSize);
     await router.mirrorClosePercentage(symbol, direction, 100);
-    setupManager.onTradeEvent('full_close', { reason: 'tp_full_hit' });
+    setupManager.onTradeEvent('full_close', { reason: 'tp_full_hit', closedSize, pnl });
   } else if (exitType === 'sl_hit') {
+    const exitPrice = trade.slMovedToEntry ? trade.entryPrice : trade.sl;
+    const closedSize = trade.remainingSize;
+    const pnl = realizedPnl(exitPrice, closedSize);
     await router.mirrorClosePercentage(symbol, direction, 100);
-    setupManager.onTradeEvent('sl_hit', { reason: setup.trade.slMovedToEntry ? 'breakeven_stop' : 'sl_hit' });
+    setupManager.onTradeEvent('sl_hit', { reason: trade.slMovedToEntry ? 'breakeven_stop' : 'sl_hit', closedSize, pnl });
   }
 
   return exitType;

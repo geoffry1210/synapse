@@ -263,6 +263,7 @@ class SetupManager {
       slMovedToEntry: false,
       tp1Hit: false,
       tp2Hit: false,
+      realizedPnl: 0, // running total across partial closes; see onTradeEvent
     };
 
     this._emit('trade_entered', { direction: setup.direction, entryPrice, size, fib: setup.fib });
@@ -276,18 +277,31 @@ class SetupManager {
   onTradeEvent(eventName, data = {}) {
     const setup = this.activeSetup;
     if (!setup || !setup.trade) return;
+    const trade = setup.trade;
+
+    // closedSize/pnl are populated by exitMonitor.js for every exit type
+    // now (previously only null was ever recorded). remainingSize and the
+    // running realizedPnl total are tracked here so the final full_close/
+    // sl_hit event can report the trade's TOTAL P&L across every partial,
+    // not just the last chunk closed.
+    if (data.closedSize != null) trade.remainingSize = Math.max(0, trade.remainingSize - data.closedSize);
+    if (data.pnl != null) trade.realizedPnl = (trade.realizedPnl ?? 0) + data.pnl;
 
     if (eventName === 'tp1_hit') {
-      setup.trade.tp1Hit = true;
-      setup.trade.slMovedToEntry = true;
+      trade.tp1Hit = true;
+      trade.slMovedToEntry = true;
       setup.status = STATUS.MANAGING_EXITS;
     } else if (eventName === 'tp2_hit') {
-      setup.trade.tp2Hit = true;
+      trade.tp2Hit = true;
     } else if (eventName === 'full_close' || eventName === 'sl_hit') {
       setup.status = STATUS.CLOSED;
     }
 
-    this._emit(eventName, { direction: setup.direction, ...data });
+    const emitData = { direction: setup.direction, ...data };
+    if (eventName === 'full_close' || eventName === 'sl_hit') {
+      emitData.pnl = trade.realizedPnl; // total across all partials, not just this chunk
+    }
+    this._emit(eventName, emitData);
   }
 }
 
