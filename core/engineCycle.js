@@ -151,13 +151,37 @@ async function runSymbolCycle(candles, deps, opts = {}) {
       if (control && !control.entriesAllowed()) {
         // bot paused or stopped: keep the setup alive, skip the entry
       } else if (allowed) {
-        const results = await router.mirrorEntry(setupManager.symbol, setup.direction, setup.fib);
-        // Use the fib entry as the recorded entry price (mirrors across
-        // venues may fill at slightly different prices; fib.entry is the
-        // reference the whole system reasons about).
-        const anySucceeded = Object.values(results).some((r) => r.success);
-        if (anySucceeded) {
-          setupManager.enterTrade(setup.fib.entry, 1); // size is per-venue internally; this is a nominal reference size
+        // Size and validate against the REAL market price, not fib.entry
+        // (the original structure-leg price, which can be far from where
+        // the bot actually enters once price has moved through the OB
+        // zone — this was the root cause of real risk averaging 2x the
+        // intended amount, up to 6x, and of firing an instant fake TP1
+        // "win" on setups where price had already passed it before entry
+        // even happened).
+        const referencePrice = latestCandle.close;
+        const dir = setup.direction === 'bullish' ? 1 : -1;
+        const pastStop = dir === 1 ? referencePrice <= setup.fib.sl : referencePrice >= setup.fib.sl;
+        const plannedRoom = (setup.fib.tp1 - setup.fib.entry) * dir;
+        const remainingRoom = (setup.fib.tp1 - referencePrice) * dir;
+        const roomPct = plannedRoom > 0 ? (remainingRoom / plannedRoom) * 100 : 0;
+
+        if (pastStop || roomPct < 20) {
+          setupManager.emitSkip('entry_invalid_at_fill', {
+            direction: setup.direction,
+            reason: pastStop ? 'price_past_stop' : 'tp1_already_passed',
+            referencePrice,
+            roomPct: Math.round(roomPct),
+          });
+        } else {
+          const results = await router.mirrorEntry(setupManager.symbol, setup.direction, setup.fib, referencePrice);
+          const successful = Object.values(results).filter((r) => r.success);
+          if (successful.length > 0) {
+            const totalSize = successful.reduce((sum, r) => sum + (r.size ?? 0), 0);
+            const weightedEntry = totalSize > 0
+              ? successful.reduce((sum, r) => sum + (r.fillPrice ?? referencePrice) * (r.size ?? 0), 0) / totalSize
+              : referencePrice;
+            setupManager.enterTrade(weightedEntry, totalSize);
+          }
         }
       } else if (telegramBot) {
         await telegramBot.notify(

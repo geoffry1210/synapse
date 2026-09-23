@@ -52,9 +52,13 @@ class ExecutionRouter {
    * @param {string} symbol
    * @param {'bullish'|'bearish'} direction
    * @param {{ entry: number, sl: number, tp1: number, tp2: number, tpFull: number }} fib
+   * @param {number} [referencePrice] - real market price to size against (last
+   *   closed candle's close). Falls back to fib.entry only if omitted, which
+   *   should only happen from older/test call sites.
    * @returns {Promise<Record<string, VenueResult>>}
    */
-  async mirrorEntry(symbol, direction, fib) {
+  async mirrorEntry(symbol, direction, fib, referencePrice) {
+    const entryPriceForSizing = referencePrice ?? fib.entry;
     const side = direction === 'bullish' ? 'buy' : 'sell';
     const closingSide = side === 'buy' ? 'sell' : 'buy';
     const venueNames = Object.keys(this.adapters);
@@ -64,10 +68,10 @@ class ExecutionRouter {
       venueNames.map(async (venueName) => {
         const adapter = this.adapters[venueName];
         const balance = await adapter.getBalance();
-        const maxLeverage = typeof adapter.prepareLeverage === 'function' ? await adapter.prepareLeverage(symbol, fib.entry, fib.sl) : undefined;
+        const maxLeverage = typeof adapter.prepareLeverage === 'function' ? await adapter.prepareLeverage(symbol, entryPriceForSizing, fib.sl) : undefined;
         const { size } = computePositionSize({
           balance,
-          entryPrice: fib.entry,
+          entryPrice: entryPriceForSizing,
           slPrice: fib.sl,
           venueCount: venueNames.length,
           maxLeverage,
