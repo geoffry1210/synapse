@@ -83,6 +83,14 @@ class Journal {
       [tradeId, eventType, JSON.stringify(data)]
     );
 
+    // remaining_size was previously only ever set once, at creation, and
+    // never updated after partial closes. Only takes effect once the
+    // paired setupManager.js/exitMonitor.js fix (Patch B) is also live and
+    // starts supplying closedSize on exit events — inert no-op until then.
+    if (data.closedSize != null) {
+      await this.pool.query(`UPDATE trades SET remaining_size = GREATEST(0, remaining_size - $2) WHERE id = $1`, [tradeId, data.closedSize]);
+    }
+
     if (eventType === 'tp1_hit') {
       await this.pool.query(`UPDATE trades SET tp1_hit = true, sl_moved_to_entry = true WHERE id = $1`, [tradeId]);
     } else if (eventType === 'tp2_hit') {
