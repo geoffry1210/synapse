@@ -93,6 +93,19 @@ function createDashboardHandler(deps) {
     paperBalance = 10000,
   } = deps;
 
+  // Loud, unmissable warning if this looks like a real deployment (Render
+  // sets these env vars automatically) and no DASHBOARD_TOKEN is configured
+  // — otherwise every read endpoint (trades, journal, live state, candles)
+  // is served to anyone on the internet with no auth, silently.
+  if (!token && (process.env.RENDER || process.env.RENDER_EXTERNAL_URL)) {
+    const url = process.env.RENDER_EXTERNAL_URL || '(unknown URL)';
+    console.warn(
+      `\n🚨 DASHBOARD_TOKEN is not set — the dashboard read API is PUBLICLY\n` +
+      `   exposed with no auth at ${url}/api/*\n` +
+      `   Set DASHBOARD_TOKEN in the Render dashboard to lock it down.\n`
+    );
+  }
+
   const clients = new Set();
   const tickCache = new Map(); // symbol -> { at, data }
   const num = (v) => (v === null || v === undefined ? null : Number(v));
