@@ -5,16 +5,20 @@
   "main": "main.js",
   "scripts": {
     "start": "node main.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/run.js"
   },
-  "keywords": ["trading-bot", "telegram", "smc", "crypto"],
+  "keywords": [
+    "trading-bot",
+    "telegram",
+    "smc",
+    "crypto"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "canvas": "^3.2.3",
     "ccxt": "^4.5.78",
     "grammy": "^1.46.0",
-    "metaapi.cloud-sdk": "^29.3.3",
     "pg": "^8.23.0"
   }
 }

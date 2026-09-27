@@ -42,7 +42,7 @@ for (const stage of stages) {
   const buf = renderSetupChart(stage.candlesSlice, stage.setup, {
     title: `BTCUSDT — ${stage.setup.direction.toUpperCase()} — ${stage.setup.status}`,
   });
-  const path = `/home/claude/trading-bot/chart-${stage.name}.png`;
+  const path = require('path').join(__dirname, `chart-${stage.name}.png`);
   fs.writeFileSync(path, buf);
   console.log(`Saved ${path} (${buf.length} bytes)`);
 }

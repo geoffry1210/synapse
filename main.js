@@ -36,7 +36,8 @@ const { runSymbolCycle } = require('./core/engineCycle');
 const { fetchCandlesFor, buildScannerUniverse, fetchMarketCapTiers } = require('./core/dataSource');
 const { Journal } = require('./journal/journal');
 const { CcxtAdapter } = require('./execution/ccxtAdapter');
-const { Mt5Adapter } = require('./execution/mt5Adapter');
+// Mt5Adapter is required lazily below, only when MT5 is actually configured —
+// see execution/mt5Adapter.js for why (it's not in package.json's dependencies).
 const { DryRunAdapter } = require('./execution/dryRunAdapter');
 const { ExecutionRouter } = require('./execution/executionRouter');
 const { TradingBot } = require('./telegram/bot');
@@ -114,6 +115,7 @@ async function main() {
   const adapters = buildExecutionAdapters();
 
   if (!DRY_RUN && !BYBIT_DEMO && process.env.MT5_TOKEN && process.env.MT5_ACCOUNT_ID) {
+    const { Mt5Adapter } = require('./execution/mt5Adapter');
     const mt5 = new Mt5Adapter(process.env.MT5_TOKEN, process.env.MT5_ACCOUNT_ID);
     await mt5.connect();
     adapters.mt5 = mt5;

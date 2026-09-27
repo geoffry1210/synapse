@@ -16,14 +16,22 @@
  * -----------------------------------------------------------------------
  */
 
-const MetaApi = require('metaapi.cloud-sdk').default;
-
 class Mt5Adapter {
   /**
    * @param {string} token - MetaApi API token
    * @param {string} accountId - your MetaApi account id (links to the MT5 login)
    */
   constructor(token, accountId) {
+    let MetaApi;
+    try {
+      MetaApi = require('metaapi.cloud-sdk').default;
+    } catch (e) {
+      throw new Error(
+        "MT5_TOKEN/MT5_ACCOUNT_ID are set but 'metaapi.cloud-sdk' isn't installed. " +
+        "It's intentionally left out of package.json (old vulnerable transitive deps) " +
+        "since most deployments don't use MT5. Run: npm install metaapi.cloud-sdk"
+      );
+    }
     this.venueName = 'mt5';
     this.api = new MetaApi(token);
     this.accountId = accountId;
