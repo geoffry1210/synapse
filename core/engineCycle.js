@@ -126,6 +126,13 @@ async function runSymbolCycle(candles, deps, opts = {}) {
   // 2. OB invalidation + zone entry check for whatever setup is active.
   setupManager.onPriceUpdate(latestCandle, latestIndex);
 
+  // Expire a setup that's been stuck pre-trade too long (no confluence
+  // progress, never invalidated by price) so it can't permanently block
+  // this symbol from ever getting a fresh setup. Default 72h — generous
+  // enough for real multi-day consolidation, bounded enough to guarantee
+  // the symbol isn't stuck indefinitely. See setupManager.checkExpiry().
+  setupManager.checkExpiry(opts.maxSetupAgeMs ?? 72 * 60 * 60 * 1000);
+
   const setup = setupManager.activeSetup;
 
   // 3. Confluence checking, only while waiting.

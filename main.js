@@ -34,6 +34,7 @@ const { TradeLimiter } = require('./core/tradeLimiter');
 const { enforceMaxHoldingPeriod } = require('./core/maxHoldingPeriod');
 const { runSymbolCycle } = require('./core/engineCycle');
 const { fetchCandlesFor, buildScannerUniverse, fetchMarketCapTiers } = require('./core/dataSource');
+const { CandleFreshnessGuard } = require('./core/candleFreshnessGuard');
 const { Journal } = require('./journal/journal');
 const { CcxtAdapter } = require('./execution/ccxtAdapter');
 // Mt5Adapter is required lazily below, only when MT5 is actually configured —
@@ -192,9 +193,23 @@ async function main() {
   // than starting a second pass on top of it — this is what let sweeps
   // compound into runaway resource usage and crash-loop restarts before.
   let engineCycleRunning = false;
+  // Detects a symbol's SIGNAL_TIMEFRAME candle feed silently getting stuck
+  // (same latest candle for way longer than the timeframe should ever
+  // allow) — otherwise indistinguishable from the market just being quiet.
+  // Alerts via Telegram if configured, always via console.warn either way.
+  const candleFreshnessGuard = new CandleFreshnessGuard(SIGNAL_TIMEFRAME, 6, (symbol, info) => {
+    const mins = Math.round(info.stuckForMs / 60_000);
+    console.warn(`⚠️  ${symbol}: candle feed appears stuck — latest candle unchanged for ~${mins}m.`);
+    if (telegramBot) {
+      telegramBot
+        .notify(`⚠️ ${symbol}: candle feed appears stuck — latest candle unchanged for ~${mins}m. Possibly a stale/cached exchange feed.`)
+        .catch(() => {});
+    }
+  });
   async function tickSymbol(symbol) {
     try {
       const candles = await getCandles(symbol);
+      candleFreshnessGuard.check(symbol, candles);
 
       let htfCandles;
       if (HTF_BIAS_ENABLED) {

@@ -57,6 +57,16 @@ class SetupManager {
   _emit(type, data = {}) {
     const entry = { symbol: this.symbol, type, time: Date.now(), ...data };
     this.log.push(entry);
+    // Every state-changing event the engine produces funnels through here
+    // (setup created/skipped/cancelled, confluence flags, trade lifecycle),
+    // so this single console.log is enough to make a future stall
+    // diagnosable straight from Render logs instead of requiring a DB
+    // query — without adding scattered logging throughout engineCycle.js.
+    // Not tick-spammy: this only fires on actual state changes (skip
+    // events are gated to new structure events upstream, confluence
+    // flags only log on their first transition to true — see
+    // onConfluenceFlag below).
+    console.log(`[engine] ${this.symbol} ${type}`, JSON.stringify(data));
     return entry;
   }
 
@@ -109,6 +119,7 @@ class SetupManager {
       alignsWithBias: meta.alignsWithBias ?? null,
       zoneEnteredAt: null, // set once price enters the OB zone — see onPriceUpdate
       ltfConfirmed: false, // set via onLtfConfirmation(), only relevant for the 'confirmation' entry model
+      createdAt: Date.now(), // wall-clock, for checkExpiry() below — createdAtIndex is a candle index, not a timestamp
     };
 
     this._emit('setup_created', {
@@ -171,6 +182,33 @@ class SetupManager {
     }
 
     return true;
+  }
+
+  /**
+   * Cancels the active setup if it's been sitting in a non-terminal,
+   * pre-trade state (OB_IDENTIFIED or IN_ZONE_AWAITING_CONFLUENCE) for
+   * longer than maxAgeMs, with no confluence progress or invalidation
+   * either way. Without this, a setup that never gets confluence and
+   * never gets invalidated by price stays "active" forever, silently
+   * blocking the symbol from ever picking up a fresh setup — this was
+   * found after 31 real setups sat stuck in IN_ZONE_AWAITING_CONFLUENCE
+   * for 39+ hours with nothing superseding them.
+   *
+   * Once-in-a-trade setups (IN_TRADE/MANAGING_EXITS) are never touched
+   * here — those exit via exitMonitor.js on their own SL/TP logic.
+   *
+   * @param {number} maxAgeMs
+   */
+  checkExpiry(maxAgeMs) {
+    const setup = this.activeSetup;
+    if (!setup) return;
+    if (setup.status !== STATUS.OB_IDENTIFIED && setup.status !== STATUS.IN_ZONE_AWAITING_CONFLUENCE) return;
+
+    const ageMs = Date.now() - setup.createdAt;
+    if (ageMs > maxAgeMs) {
+      setup.status = STATUS.CANCELLED;
+      this._emit('setup_cancelled', { reason: 'expired_stale', direction: setup.direction, ageMs });
+    }
   }
 
   /**
