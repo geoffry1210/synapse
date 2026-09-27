@@ -63,6 +63,21 @@ class TradingBot {
   }
 
   _registerCommands() {
+    // Reject every update that isn't from the configured owner chat, before
+    // any command handler below runs. Silent (no reply) rather than an
+    // explicit "not authorized" message — this bot previously had NO auth
+    // check at all, meaning anyone who found its @username could message
+    // it and run /setrisk or /setweeklytradelimit to change live trading
+    // parameters. Silence also avoids confirming to a stranger that the
+    // bot is even listening.
+    this.bot.use(async (ctx, next) => {
+      const senderChatId = ctx.chat?.id;
+      if (this.chatId === undefined || this.chatId === null || String(senderChatId) !== String(this.chatId)) {
+        return;
+      }
+      return next();
+    });
+
     this.bot.command('trades', async (ctx) => {
       const trades = await getRecentTrades(this.pool, 10);
       await ctx.reply(formatTradesList(trades));
