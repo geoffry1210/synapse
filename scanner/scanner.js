@@ -66,6 +66,11 @@ function scanMarket(symbolCandleMap, pumpOpts = {}) {
       dumpProbability: score,
       breakdown,
       priorityScore: Math.round(score * tierWeight),
+      // Pre-pump low (origin of the impulse leg) — needed by dumpTrader.js
+      // to compute SL/TP1 fib levels for an actual short entry. Additive
+      // field; existing consumers (Telegram formatting) ignore it.
+      pumpLow: pump.windowLow,
+      pumpIndex: pump.index,
     });
   }
 
