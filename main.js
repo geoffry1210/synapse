@@ -43,6 +43,8 @@ const { DryRunAdapter } = require('./execution/dryRunAdapter');
 const { ExecutionRouter } = require('./execution/executionRouter');
 const { TradingBot } = require('./telegram/bot');
 const { scanMarket } = require('./scanner/scanner');
+const { DumpTradeManager } = require('./scanner/dumpTrader');
+const { processDumpExit } = require('./scanner/dumpExitMonitor');
 const { createDashboardHandler, BotControl } = require('./api/dashboardServer');
 
 const DRY_RUN = process.env.DRY_RUN !== 'false'; // default to dry-run/paper-trading for safety
@@ -265,6 +267,13 @@ async function main() {
   // SCANNER_ENABLED=false is a fast kill-switch (no redeploy) if this job is
   // ever suspected of causing instability again.
   const SCANNER_ENABLED = process.env.SCANNER_ENABLED !== 'false';
+  // Separate, redeploy-free kill-switch from SCANNER_ENABLED: turning this
+  // off keeps pump/dump alerts flowing but stops NEW dump-shorts from being
+  // opened — same fast-off philosophy as SCANNER_ENABLED itself. Currently-
+  // open dump-trades are still managed either way (see the exit-check loop
+  // below), so disabling this never abandons an open position.
+  const DUMP_TRADING_ENABLED = process.env.DUMP_TRADING_ENABLED !== 'false';
+  const dumpTrader = new DumpTradeManager();
   let scannerRunning = false;
   let cachedTiers = null;
   let cachedTiersAt = 0;
@@ -307,6 +316,39 @@ async function main() {
         const alerts = scanMarket(universe, { windowCandles: 24, thresholdPct: 30 });
         for (const alert of alerts) {
           if (telegramBot) await telegramBot.notifyScannerAlert(alert);
+        }
+
+        // Dump-short auto-trading: enter on high-dump-probability alerts,
+        // then check exits for every symbol currently held. Sequential
+        // (not parallel) so tradeLimiter's weekly-count check can't race
+        // across alerts in the same cycle — same reasoning as Job 1's
+        // symbol loop. Exits are checked at this same SCAN_INTERVAL_MS
+        // cadence (reusing these already-fetched candles) rather than a
+        // tighter dedicated interval — a real trade-off on a fast-moving
+        // low-cap (meaningful slippage past the intended SL is possible
+        // between checks); tightening this is a reasonable follow-up if
+        // it matters in practice.
+        if (DUMP_TRADING_ENABLED) {
+          for (const alert of alerts) {
+            await dumpTrader.maybeEnter(alert, universe[alert.symbol]?.candles, {
+              router,
+              tradeLimiter,
+              control,
+              telegramBot,
+            });
+          }
+        }
+        for (const symbol of [...dumpTrader.trades.keys()]) {
+          const candles = universe[symbol]?.candles;
+          if (!candles) {
+            console.warn(`[dump] ${symbol}: fell out of this scan's universe, skipping exit check this cycle`);
+            continue;
+          }
+          await processDumpExit(dumpTrader.getTrade(symbol), candles, {
+            router,
+            dumpTradeManager: dumpTrader,
+            telegramBot,
+          });
         }
       } catch (err) {
         console.error('Scanner sweep failed:', err.message);
