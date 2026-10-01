@@ -87,7 +87,7 @@ class BotControl {
 function createDashboardHandler(deps) {
   const {
     pool, router, setupManagers, settingsStore, tradeLimiter, control,
-    adapters, getCandles, getTicker, dryRun, mode,
+    adapters, getCandles, getTicker, dryRun, mode, dumpTrader,
     token = process.env.DASHBOARD_TOKEN,
     staticDir = path.join(__dirname, '..', 'dashboard'),
     paperBalance = 10000,
@@ -164,7 +164,7 @@ function createDashboardHandler(deps) {
 
     // positions
     const prices = {};
-    const symbols = new Set([...openTrades.rows.map((t) => t.symbol), ...openSetups.rows.map((s) => s.symbol)]);
+    const symbols = new Set([...openTrades.rows.map((t) => t.symbol), ...openSetups.rows.map((s) => s.symbol), ...(dumpTrader ? dumpTrader.trades.keys() : [])]);
     await Promise.all([...symbols].map(async (s) => {
       const t = await mark(s);
       if (t) prices[s] = { last: t.last, chg24: t.percentage, high24: t.high, low24: t.low, vol24: t.quoteVolume };
@@ -195,6 +195,26 @@ function createDashboardHandler(deps) {
       };
     });
 
+    // Dump-shorts live only in dumpTrader's in-memory Map (see the review
+    // note in scanner/dumpTrader.js) — folded in here so Open Positions,
+    // exposure and Emergency Stop all see them, not just the order-block
+    // strategy's DB-backed trades above.
+    const dumpPositions = dumpTrader ? [...dumpTrader.trades.values()].map((t) => {
+      const m = prices[t.symbol]?.last ?? t.entryPrice;
+      const notional = t.remainingSize * m;
+      const margin = lev ? notional / lev : notional;
+      const upnl = (t.entryPrice - m) * t.remainingSize; // dump-shorts are always short
+      return {
+        id: `dump-${t.symbol}`, setupId: null, symbol: t.symbol, side: 'short',
+        entry: t.entryPrice, mark: m, qty: t.size, remaining: t.remainingSize, notional, leverage: lev, margin,
+        upnl, roi: margin ? (upnl / margin) * 100 : 0,
+        sl: t.sl, tp1: t.tp1, tp2: null, tpFull: null,
+        tp1Hit: t.tp1Hit, tp2Hit: false, slBE: t.slMovedToEntry, liq: null,
+        openedAt: t.openedAt, venue: t.venue, strategy: 'Dump-short',
+      };
+    }) : [];
+    positions.push(...dumpPositions);
+
     // "Open orders": resting protective legs of open trades + waiting entries
     const orders = [];
     for (const p of positions) {
@@ -206,8 +226,8 @@ function createDashboardHandler(deps) {
       });
       leg('SL', p.sl, 1, false);
       leg('TP1', p.tp1, 0.3, p.tp1Hit);
-      leg('TP2', p.tp2, 0.21, p.tp2Hit);
-      leg('TPF', p.tpFull, 0.49, false);
+      if (p.tp2 != null) leg('TP2', p.tp2, 0.21, p.tp2Hit);
+      if (p.tpFull != null) leg('TPF', p.tpFull, 0.49, false);
     }
 
     const setups = openSetups.rows.map((s) => {
@@ -301,18 +321,33 @@ function createDashboardHandler(deps) {
   async function closePosition(symbol, pct) {
     const sm = setupManagers.get(symbol);
     const setup = sm?.activeSetup;
-    if (!setup?.trade) throw new Error(`No open position for ${symbol}`);
-    const results = await router.mirrorClosePercentage(symbol, setup.direction, pct);
-    if (!Object.values(results).some((r) => r.success)) throw new Error('Every venue rejected the close: ' + JSON.stringify(results));
-    if (pct >= 100) {
-      sm.onTradeEvent('trade_closed', { reason: 'manual_close' });
-      setup.status = 'CLOSED';
-      control.push({ type: 'position_closed', level: 'warn', symbol, text: 'Manually closed from dashboard' });
-    } else {
-      setup.trade.remainingSize = setup.trade.remainingSize * (1 - pct / 100);
-      control.push({ type: 'position_reduced', level: 'warn', symbol, text: `Manually reduced ${pct}% from dashboard` });
+    if (setup?.trade) {
+      const results = await router.mirrorClosePercentage(symbol, setup.direction, pct);
+      if (!Object.values(results).some((r) => r.success)) throw new Error('Every venue rejected the close: ' + JSON.stringify(results));
+      if (pct >= 100) {
+        sm.onTradeEvent('trade_closed', { reason: 'manual_close' });
+        setup.status = 'CLOSED';
+        control.push({ type: 'position_closed', level: 'warn', symbol, text: 'Manually closed from dashboard' });
+      } else {
+        setup.trade.remainingSize = setup.trade.remainingSize * (1 - pct / 100);
+        control.push({ type: 'position_reduced', level: 'warn', symbol, text: `Manually reduced ${pct}% from dashboard` });
+      }
+      return results;
     }
-    return results;
+    if (dumpTrader?.hasOpenTrade(symbol)) {
+      const results = await router.mirrorClosePercentage(symbol, 'bearish', pct);
+      if (!Object.values(results).some((r) => r.success)) throw new Error('Every venue rejected the close: ' + JSON.stringify(results));
+      const trade = dumpTrader.getTrade(symbol);
+      if (pct >= 100) {
+        dumpTrader.removeTrade(symbol);
+        control.push({ type: 'position_closed', level: 'warn', symbol, text: 'Dump-short manually closed from dashboard' });
+      } else {
+        trade.remainingSize = trade.remainingSize * (1 - pct / 100);
+        control.push({ type: 'position_reduced', level: 'warn', symbol, text: `Dump-short manually reduced ${pct}% from dashboard` });
+      }
+      return results;
+    }
+    throw new Error(`No open position for ${symbol}`);
   }
 
   async function emergencyStop() {
@@ -322,6 +357,12 @@ function createDashboardHandler(deps) {
       if (sm.activeSetup?.trade && ['IN_TRADE', 'MANAGING_EXITS'].includes(sm.activeSetup.status)) {
         try { out[symbol] = await closePosition(symbol, 100); }
         catch (e) { out[symbol] = { error: e.message }; control.push({ type: 'error', level: 'error', symbol, text: 'Emergency close failed: ' + e.message }); }
+      }
+    }
+    if (dumpTrader) {
+      for (const symbol of [...dumpTrader.trades.keys()]) {
+        try { out[symbol] = await closePosition(symbol, 100); }
+        catch (e) { out[symbol] = { error: e.message }; control.push({ type: 'error', level: 'error', symbol, text: 'Emergency close (dump-short) failed: ' + e.message }); }
       }
     }
     return out;

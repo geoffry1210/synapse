@@ -126,6 +126,13 @@ async function main() {
 
   const router = new ExecutionRouter(adapters, { mode: 'per_venue', riskPct: envNumber('RISK_PCT', 1) }, settingsStore);
 
+  // Hoisted above the dashboard/Job setup (was previously declared inside
+  // the SCANNER_ENABLED block below) so both the dashboard and Job 2 share
+  // the same instance — the dashboard needs it even when the scanner is
+  // currently disabled, so Emergency Stop can still flatten a dump-short
+  // that was opened before SCANNER_ENABLED was turned off.
+  const dumpTrader = new DumpTradeManager();
+
   // Market data (OHLCV, symbol lists) uses its own public, no-auth ccxt
   // instances — independent of DRY_RUN, since even paper trading should
   // run against real prices. Bybit is the reference signal source; both
@@ -184,6 +191,7 @@ async function main() {
   const logSeen = new Map();
   const dashboard = createDashboardHandler({
     pool, router, setupManagers, settingsStore, tradeLimiter, control, adapters,
+    dumpTrader,
     dryRun: DRY_RUN && !BYBIT_DEMO, mode: EXEC_MODE, paperBalance: PAPER_BALANCE,
     getCandles: (symbol, tf = SIGNAL_TIMEFRAME) => fetchCandlesFor(marketData.bybit, toCcxtSymbol(symbol), tf, 300),
     getTicker: (symbol) => marketData.bybit.fetchTicker(toCcxtSymbol(symbol)),
@@ -273,7 +281,6 @@ async function main() {
   // open dump-trades are still managed either way (see the exit-check loop
   // below), so disabling this never abandons an open position.
   const DUMP_TRADING_ENABLED = process.env.DUMP_TRADING_ENABLED !== 'false';
-  const dumpTrader = new DumpTradeManager();
   let scannerRunning = false;
   let cachedTiers = null;
   let cachedTiersAt = 0;
