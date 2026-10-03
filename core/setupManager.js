@@ -327,7 +327,11 @@ class SetupManager {
 
     if (eventName === 'tp1_hit') {
       trade.tp1Hit = true;
-      trade.slMovedToEntry = true;
+      // data.slMoved is set by exitMonitor.js's processExit based on
+      // whether the stop-move actually succeeded on the exchange;
+      // defaults to true when omitted (e.g. demo-telegram.js's direct
+      // calls) to preserve the previous unconditional behavior.
+      trade.slMovedToEntry = data.slMoved !== false;
       setup.status = STATUS.MANAGING_EXITS;
     } else if (eventName === 'tp2_hit') {
       trade.tp2Hit = true;

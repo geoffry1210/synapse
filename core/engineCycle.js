@@ -21,7 +21,31 @@ const { scoreOrderBlock } = require('./orderblockValidator');
 const { checkLtfConfirmation } = require('./ltfConfirmation');
 const { precomputeCipherB, reportCipherBFlags } = require('../confluence/cipherB');
 const { precomputeOptional, reportOptionalFlags, computeFRVPForSetup } = require('../confluence/optional');
-const { processExit } = require('./exitMonitor');
+const { processExit, closeForSupersede } = require('./exitMonitor');
+const { STATUS } = require('./setupManager');
+
+/**
+ * If the setup currently active for this symbol is a live trade
+ * (IN_TRADE/MANAGING_EXITS), force-closes it on the exchange before a
+ * new structure event is allowed to supersede it locally — see
+ * closeForSupersede's header in exitMonitor.js for the full rationale.
+ *
+ * @returns {Promise<boolean>} true if it's safe to proceed with the new
+ *   event (nothing live was active, or the close succeeded); false if a
+ *   live trade exists and couldn't be confirmed closed — the caller must
+ *   skip this event for now rather than abandoning the still-open trade.
+ */
+async function closeLiveTradeIfAny(setupManager, router, latestCandle, event, telegramBot) {
+  const active = setupManager.activeSetup;
+  if (!active || (active.status !== STATUS.IN_TRADE && active.status !== STATUS.MANAGING_EXITS)) {
+    return true;
+  }
+  const closed = await closeForSupersede(setupManager, router, latestCandle.close, telegramBot);
+  if (!closed) {
+    setupManager.emitSkip('supersede_close_failed', { direction: event.direction });
+  }
+  return closed;
+}
 
 /**
  * @typedef {Object} CycleDeps
@@ -116,9 +140,21 @@ async function runSymbolCycle(candles, deps, opts = {}) {
         continue;
       }
 
+      // onStructureEvent below is about to run (possibly superseding
+      // whatever's currently active) no matter which branch of this
+      // if/else we're in — so if there's a LIVE trade active, it must
+      // actually be closed on the exchange first. onStructureEvent only
+      // updates local bookkeeping; it has no way to touch the router, so
+      // without this a real position got silently abandoned every time a
+      // new structure event arrived mid-trade (marked closed in our own
+      // records while remaining open on the exchange, unmonitored from
+      // that point on). See closeForSupersede's own header for details.
+      if (!(await closeLiveTradeIfAny(setupManager, router, latestCandle, event, telegramBot))) continue;
+
       const alignsWithBias = htfBiasResult ? event.direction === htfBiasResult.bias : null;
       setupManager.onStructureEvent(candles, event, computeFibLevels(event), { obScore: scoreResult.totalScore, alignsWithBias });
     } else {
+      if (!(await closeLiveTradeIfAny(setupManager, router, latestCandle, event, telegramBot))) continue;
       setupManager.onStructureEvent(candles, event, computeFibLevels(event)); // let onStructureEvent's own ob_not_found path handle it
     }
   }
@@ -200,7 +236,7 @@ async function runSymbolCycle(candles, deps, opts = {}) {
 
   // 4. Exit monitoring for open trades.
   if (setup && (setup.status === 'IN_TRADE' || setup.status === 'MANAGING_EXITS')) {
-    await processExit(setupManager, router, latestCandle);
+    await processExit(setupManager, router, latestCandle, telegramBot);
   }
 
   // 5. Persist + notify.
