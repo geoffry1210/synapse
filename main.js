@@ -66,9 +66,15 @@ const HOLD_CHECK_INTERVAL_MS = envNumber('HOLD_CHECK_INTERVAL_MS', 60 * 60_000);
 const PAPER_BALANCE = envNumber('PAPER_BALANCE', 10_000); // starting simulated balance per venue in DRY_RUN mode
 const SIGNAL_TIMEFRAME = process.env.SIGNAL_TIMEFRAME ?? '1h'; // candle interval the main engine reasons about
 const HTF_BIAS_ENABLED = process.env.HTF_BIAS_ENABLED !== 'false'; // daily+4H trend-agreement filter (htfBias.js) — was wired in engineCycle.js but never actually called with data until this fix
-const ENTRY_MODEL = process.env.ENTRY_MODEL === 'confirmation' ? 'confirmation' : 'aggressive'; // 'aggressive' = Model 1 (original). 'confirmation' = Model 2, needs a matching LTF CHoCH inside the zone too
+// Per-setup dynamic by default: a high OB+live-orderbook probability setup
+// gets an aggressive entry, a weaker one needs LTF confirmation — decided
+// per setup in engineCycle.js, not globally. Setting ENTRY_MODEL forces
+// EVERY setup to that one model instead (manual override/testing escape
+// hatch); leave it unset for the normal dynamic behavior.
+const ENTRY_MODEL_OVERRIDE = (process.env.ENTRY_MODEL === 'aggressive' || process.env.ENTRY_MODEL === 'confirmation') ? process.env.ENTRY_MODEL : null;
+const AGGRESSIVE_ENTRY_THRESHOLD = envNumber('AGGRESSIVE_ENTRY_THRESHOLD', 75); // 0-100 combined OB+orderbook score; at/above = aggressive entry
 const MIN_OB_SCORE = envNumber('MIN_OB_SCORE', 50); // 0-100 orderblockValidator score floor
-const LTF_TIMEFRAME = process.env.LTF_TIMEFRAME ?? '15m'; // only fetched when ENTRY_MODEL=confirmation
+const LTF_TIMEFRAME = process.env.LTF_TIMEFRAME ?? '15m'; // always fetched now — which setups actually use it is decided per-setup, not known in advance
 
 /** "BTCUSDT" -> "BTC/USDT" (ccxt's unified symbol format). Assumes a USDT-quoted pair. */
 function toCcxtSymbol(symbol) {
@@ -227,11 +233,13 @@ async function main() {
         catch (err) { console.warn(`HTF candle fetch failed for ${symbol}, running this tick without the bias filter: ${err.message}`); }
       }
 
+      // Always fetched now (not gated behind ENTRY_MODEL): which setups
+      // actually need LTF confirmation is decided per-setup, inside
+      // engineCycle.js, based on each one's own OB+orderbook probability
+      // — there's no way to know in advance of finding the setup.
       let ltfCandles;
-      if (ENTRY_MODEL === 'confirmation') {
-        try { ltfCandles = await getLtfCandles(symbol); }
-        catch (err) { console.warn(`LTF candle fetch failed for ${symbol}, confirmation entries paused for this tick: ${err.message}`); }
-      }
+      try { ltfCandles = await getLtfCandles(symbol); }
+      catch (err) { console.warn(`LTF candle fetch failed for ${symbol}, confirmation-model entries paused for this tick: ${err.message}`); }
 
       await runSymbolCycle(candles, {
         setupManager: setupManagers.get(symbol),
@@ -241,9 +249,11 @@ async function main() {
         telegramBot,
         venueLabel: 'multi',
         control,
+        fetchOrderBook: (sym) => marketData.bybit.fetchOrderBook(toCcxtSymbol(sym)),
       }, {
         htfCandles,
-        entryModel: ENTRY_MODEL,
+        entryModelOverride: ENTRY_MODEL_OVERRIDE,
+        aggressiveThreshold: AGGRESSIVE_ENTRY_THRESHOLD,
         minObScore: MIN_OB_SCORE,
         ltfCandles,
       });

@@ -89,11 +89,15 @@ class SetupManager {
    * @param {import('./swings').Candle[]} candles
    * @param {import('./structure').StructureEvent} structureEvent
    * @param {number} fib - precomputed fib levels for this event (from computeFibLevels)
-   * @param {{ obScore?: number, alignsWithBias?: boolean }} [meta]
+   * @param {{ obScore?: number, alignsWithBias?: boolean , entryModel?: 'aggressive'|'confirmation' }} [meta]
    *   obScore: 0-100 validity score from orderblockValidator.scoreOrderBlock, if computed.
    *   alignsWithBias: whether this setup's direction matches the current HTF
    *   bias. Undefined (HTF bias not in use) falls back to the original
    *   always-normal-threshold behavior in hasFullConfluence() below.
+   *   entryModel: decided once per-setup (high OB+orderbook probability ->
+   *   'aggressive', otherwise 'confirmation') — see engineCycle.js. Defaults
+   *   to 'aggressive' when omitted, matching the previous global-default
+   *   behavior (e.g. direct onStructureEvent calls in tests/demos).
    */
   onStructureEvent(candles, structureEvent, fib, meta = {}) {
     const ob = findOrderBlock(candles, structureEvent);
@@ -117,6 +121,7 @@ class SetupManager {
       sourceEvent: structureEvent,
       obScore: meta.obScore ?? null,
       alignsWithBias: meta.alignsWithBias ?? null,
+      entryModel: meta.entryModel ?? 'aggressive',
       zoneEnteredAt: null, // set once price enters the OB zone — see onPriceUpdate
       ltfConfirmed: false, // set via onLtfConfirmation(), only relevant for the 'confirmation' entry model
       createdAt: Date.now(), // wall-clock, for checkExpiry() below — createdAtIndex is a candle index, not a timestamp
@@ -128,6 +133,7 @@ class SetupManager {
       fib,
       obScore: meta.obScore ?? null,
       alignsWithBias: meta.alignsWithBias ?? null,
+      entryModel: meta.entryModel ?? 'aggressive',
     });
   }
 

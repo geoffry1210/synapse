@@ -39,10 +39,15 @@ const THRESHOLDS = {
  * @param {import('./swings').Candle[]} candles
  * @param {import('./orderblock').OrderBlock} ob
  * @param {import('./structure').StructureEvent} event
- * @param {{ orderBookDepthRatio?: number }} [liveData]
+ * @param {{ orderbookScore?: number, orderBookDepthRatio?: number }} [liveData]
+ *   orderbookScore: optional, 0-100 from orderbookProbability.js's
+ *   computeOrderbookProbability() — a richer, multi-signal read (depth
+ *   imbalance, resting walls, depth ratio, spread) than depth ratio
+ *   alone. Used in preference to orderBookDepthRatio when both are given.
  *   orderBookDepthRatio: optional, e.g. resting size at the OB price band
  *   divided by average resting size elsewhere — > 1 means notably deeper
- *   than average. Omit entirely when order book data isn't available;
+ *   than average. Used only as a fallback when orderbookScore isn't
+ *   supplied. Omit both entirely when order book data isn't available;
  *   the bonus is simply skipped rather than penalizing the score.
  * @returns {OBScoreResult}
  */
@@ -61,7 +66,10 @@ function scoreOrderBlock(candles, ob, event, liveData = {}) {
   const score = Math.round((passedCount / keys.length) * 100);
 
   let bonusScore = 0;
-  if (typeof liveData.orderBookDepthRatio === 'number') {
+  if (typeof liveData.orderbookScore === 'number') {
+    bonusScore = Math.round((Math.max(0, Math.min(100, liveData.orderbookScore)) / 100) * THRESHOLDS.orderBookBonusMax);
+    criteria.orderBookDepth = { pass: bonusScore > 0, detail: `live order book score ${liveData.orderbookScore}/100` };
+  } else if (typeof liveData.orderBookDepthRatio === 'number') {
     // Depth ratio of 1 = average, no bonus. Ratio of 2+ = full bonus.
     bonusScore = Math.round(Math.max(0, Math.min(1, liveData.orderBookDepthRatio - 1)) * THRESHOLDS.orderBookBonusMax);
     criteria.orderBookDepth = { pass: bonusScore > 0, detail: `depth ratio ${liveData.orderBookDepthRatio.toFixed(2)}x average` };

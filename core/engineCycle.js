@@ -18,6 +18,7 @@ const { computeFibLevels } = require('./fibonacci');
 const { findOrderBlock } = require('./orderblock');
 const { computeHtfBias } = require('./htfBias');
 const { scoreOrderBlock } = require('./orderblockValidator');
+const { computeOrderbookProbability } = require('./orderbookProbability');
 const { checkLtfConfirmation } = require('./ltfConfirmation');
 const { precomputeCipherB, reportCipherBFlags } = require('../confluence/cipherB');
 const { precomputeOptional, reportOptionalFlags, computeFRVPForSetup } = require('../confluence/optional');
@@ -67,26 +68,36 @@ async function closeLiveTradeIfAny(setupManager, router, latestCandle, event, te
  *   structureLookback?: number,
  *   htfCandles?: { daily: import('./swings').Candle[], fourHour: import('./swings').Candle[] },
  *   ltfCandles?: import('./swings').Candle[],
- *   entryModel?: 'aggressive'|'confirmation',
+ *   entryModelOverride?: 'aggressive'|'confirmation',
+ *   aggressiveThreshold?: number,
  *   minObScore?: number,
- *   liveData?: { orderBookDepthRatio?: number },
+ *   liveData?: { orderbookScore?: number, orderBookDepthRatio?: number },
  * }} opts
  *   htfCandles: 1D + 4H candles for the bias filter. Omit to disable HTF
  *   filtering entirely (falls back to the original always-both-directions
  *   behavior).
- *   ltfCandles: lower-timeframe candles for Entry Model 2's confirmation
- *   check. Only consulted when entryModel is 'confirmation'.
- *   entryModel: 'aggressive' (Model 1, default) enters as soon as the OB
- *   zone + confluence gate pass. 'confirmation' (Model 2) additionally
- *   requires a matching LTF CHoCH inside the zone first.
+ *   ltfCandles: lower-timeframe candles for the 'confirmation' entry
+ *   model's check. Only consulted for setups whose entryModel ends up
+ *   'confirmation' (see entryModelOverride/aggressiveThreshold below).
+ *   entryModelOverride: force every setup to 'aggressive' or
+ *   'confirmation' regardless of its OB+orderbook probability — the
+ *   manual escape hatch (set via ENTRY_MODEL in main.js). Omit for the
+ *   normal per-setup dynamic decision described below.
+ *   aggressiveThreshold: 0-100 — a setup's combined OB score (structure +
+ *   live order book bonus, from scoreOrderBlock/orderbookProbability.js)
+ *   at or above this gets 'aggressive' entry (fires as soon as price is
+ *   in zone + confluence completes); below it gets 'confirmation' (also
+ *   needs a matching LTF CHoCH in the zone first). Defaults to 75 — a
+ *   reasonable starting point, not a tuned constant; adjust freely.
  *   minObScore: 0-100 minimum orderblockValidator score required to even
  *   watch a candidate OB. Defaults to 50 (roughly 3-of-6 criteria).
- *   liveData: passed straight to scoreOrderBlock() for the order-book-depth bonus.
+ *   liveData: merged with the live order book score (when
+ *   deps.fetchOrderBook is available) and passed to scoreOrderBlock().
  */
 async function runSymbolCycle(candles, deps, opts = {}) {
-  const { setupManager, router, journal, tradeLimiter, telegramBot, venueLabel, control } = deps;
+  const { setupManager, router, journal, tradeLimiter, telegramBot, venueLabel, control, fetchOrderBook } = deps;
   const lookback = opts.structureLookback ?? 3;
-  const entryModel = opts.entryModel ?? 'aggressive';
+  const aggressiveThreshold = opts.aggressiveThreshold ?? 75;
   const minObScore = opts.minObScore ?? 50;
   const latestIndex = candles.length - 1;
   const latestCandle = candles[latestIndex];
@@ -134,11 +145,42 @@ async function runSymbolCycle(candles, deps, opts = {}) {
     // simplest way to gate on score without touching its internals.
     const ob = findOrderBlock(candles, event);
     if (ob) {
-      const scoreResult = scoreOrderBlock(candles, ob, event, opts.liveData ?? {});
+      // Live order book read, if a fetcher was supplied — only fetched
+      // once we actually have an OB candidate worth scoring, not on
+      // every tick for every symbol regardless. A fetch failure (rate
+      // limit, network blip) just means no bonus this time, not a
+      // skipped setup — same "degrade gracefully" approach as the HTF/
+      // LTF candle fetches in main.js.
+      let liveData = opts.liveData ?? {};
+      if (fetchOrderBook && liveData.orderbookScore === undefined) {
+        try {
+          const orderbook = await fetchOrderBook(setupManager.symbol);
+          // fib.entry (the actual trigger price) sits at ob.low for a
+          // bullish OB and ob.high for a bearish one — see
+          // core/fibonacci.js's convention (fib 0 = the leg's origin,
+          // which is the OB's low for a bullish leg). Evaluating the
+          // order book around the OPPOSITE boundary would read the
+          // book at a price the setup doesn't actually trigger at.
+          const zonePrice = event.direction === 'bullish' ? ob.low : ob.high;
+          const obResult = computeOrderbookProbability(orderbook, zonePrice, event.direction);
+          liveData = { ...liveData, orderbookScore: obResult.score, orderBookDepthRatio: obResult.orderBookDepthRatio };
+        } catch (err) {
+          console.warn(`Order book fetch failed for ${setupManager.symbol}, scoring this OB without the live-depth bonus: ${err.message}`);
+        }
+      }
+
+      const scoreResult = scoreOrderBlock(candles, ob, event, liveData);
       if (scoreResult.totalScore < minObScore) {
         setupManager.emitSkip('ob_score_too_low', { direction: event.direction, obScore: scoreResult.totalScore, criteria: scoreResult.criteria });
         continue;
       }
+
+      // High OB+orderbook probability -> aggressive entry (fires as soon
+      // as price is in zone + confluence completes). Lower probability ->
+      // confirmation (also needs a matching LTF CHoCH in the zone) —
+      // decided once per setup here, not globally, so a strong setup and
+      // a weak one found back-to-back can get different treatment.
+      const entryModel = opts.entryModelOverride ?? (scoreResult.totalScore >= aggressiveThreshold ? 'aggressive' : 'confirmation');
 
       // onStructureEvent below is about to run (possibly superseding
       // whatever's currently active) no matter which branch of this
@@ -152,7 +194,7 @@ async function runSymbolCycle(candles, deps, opts = {}) {
       if (!(await closeLiveTradeIfAny(setupManager, router, latestCandle, event, telegramBot))) continue;
 
       const alignsWithBias = htfBiasResult ? event.direction === htfBiasResult.bias : null;
-      setupManager.onStructureEvent(candles, event, computeFibLevels(event), { obScore: scoreResult.totalScore, alignsWithBias });
+      setupManager.onStructureEvent(candles, event, computeFibLevels(event), { obScore: scoreResult.totalScore, alignsWithBias, entryModel });
     } else {
       if (!(await closeLiveTradeIfAny(setupManager, router, latestCandle, event, telegramBot))) continue;
       setupManager.onStructureEvent(candles, event, computeFibLevels(event)); // let onStructureEvent's own ob_not_found path handle it
@@ -180,13 +222,14 @@ async function runSymbolCycle(candles, deps, opts = {}) {
     reportCipherBFlags(setupManager, latestCandle, latestIndex, cipherBData);
     reportOptionalFlags(setupManager, candles, latestIndex, optionalData, frvp);
 
-    // Entry Model 2 (confirmation): also needs a matching LTF CHoCH inside
-    // the zone before the confluence gate is allowed to fire an entry.
-    if (entryModel === 'confirmation' && opts.ltfCandles && !setup.ltfConfirmed) {
+    // 'confirmation' setups (decided per-setup above, when this one was
+    // created — see setup.entryModel) also need a matching LTF CHoCH
+    // inside the zone before the confluence gate is allowed to fire.
+    if (setup.entryModel === 'confirmation' && opts.ltfCandles && !setup.ltfConfirmed) {
       const ltfResult = checkLtfConfirmation(opts.ltfCandles, setup, { lookback: opts.ltfLookback ?? 2 });
       if (ltfResult.confirmed) setupManager.onLtfConfirmation();
     }
-    const entryModelSatisfied = entryModel !== 'confirmation' || setup.ltfConfirmed;
+    const entryModelSatisfied = setup.entryModel !== 'confirmation' || setup.ltfConfirmed;
 
     if (setupManager.hasFullConfluence() && entryModelSatisfied) {
       const { allowed, tradesThisWeek, limit } = await tradeLimiter.canOpenNewTrade();
