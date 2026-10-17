@@ -29,6 +29,7 @@ class CcxtAdapter {
     this._modeSet = new Set();
     this._lev = new Map(); // ccxt symbol -> leverage used for the latest entry
     this._sl = new Map(); // ccxt symbol -> latest stop-loss order id
+    this._gridOrders = new Map(); // ccxt symbol -> [{ orderId, side, size, price, reduceOnly, entryPrice?, entryDirection? }], for the grid bot
 
     if (credentials._exchange) {
       this.exchange = credentials._exchange;
@@ -134,6 +135,107 @@ class CcxtAdapter {
     const pos = positions.find((p) => p.symbol === sym && Number(p.contracts) > 0);
     if (!pos) return null;
     return { size: Number(pos.contracts), entryPrice: pos.entryPrice, side: pos.side };
+  }
+
+  // --- Limit orders, for the grid bot (core/gridBot.js) ---
+  // Grid trading manages many small, independent positions per symbol at
+  // once, not one aggregate position — these methods track their own
+  // order list (_gridOrders) rather than going through getPosition()/
+  // closePercentage() above, which assume a single aggregate position.
+
+  /**
+   * Places a resting limit order and tracks it for pollFilledOrders().
+   * @param {string} symbol
+   * @param {'buy'|'sell'} side
+   * @param {number} size
+   * @param {number} price
+   * @param {{ reduceOnly?: boolean, entryPrice?: number, entryDirection?: 'buy'|'sell' }} [opts]
+   *   reduceOnly: true for a closing order, so it only ever reduces an
+   *   existing position rather than risking opening/flipping one if the
+   *   size is slightly off. entryPrice/entryDirection (the position this
+   *   order closes) are required when reduceOnly, so PnL can be computed
+   *   on fill — same contract as DryRunAdapter's placeLimitOrder.
+   * @returns {Promise<{ orderId: string }>}
+   */
+  async placeLimitOrder(symbol, side, size, price, opts = {}) {
+    if (opts.reduceOnly && (opts.entryPrice === undefined || !opts.entryDirection)) {
+      throw new Error('CcxtAdapter.placeLimitOrder: reduceOnly orders need entryPrice and entryDirection to compute PnL on fill');
+    }
+    const sym = await this._prep(symbol);
+    const amt = this._amt(sym, size);
+    const px = Number(this.exchange.priceToPrecision(sym, price));
+    const params = opts.reduceOnly ? { reduceOnly: true } : {};
+    const order = await this.exchange.createOrder(sym, 'limit', side, amt, px, params);
+    if (!this._gridOrders.has(sym)) this._gridOrders.set(sym, []);
+    this._gridOrders.get(sym).push({
+      orderId: order.id, side, size: amt, price: px,
+      reduceOnly: !!opts.reduceOnly, entryPrice: opts.entryPrice, entryDirection: opts.entryDirection,
+    });
+    return { orderId: order.id };
+  }
+
+  /** No-op (other than dropping tracking) if the order already filled or doesn't exist. */
+  async cancelOrder(symbol, orderId) {
+    const sym = await this._prep(symbol);
+    try { await this.exchange.cancelOrder(orderId, sym); }
+    catch (e) { if (!/not exist|order not found|already|cancel/i.test(e.message)) throw e; }
+    const tracked = this._gridOrders.get(sym);
+    if (tracked) {
+      const idx = tracked.findIndex((o) => o.orderId === orderId);
+      if (idx !== -1) tracked.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Checks every order this adapter has placed via placeLimitOrder (and
+   * not yet reported filled or canceled) against the exchange, and
+   * returns the ones that have genuinely filled since the last call —
+   * distinguishing that from one that got canceled or rejected outside
+   * our control (e.g. from the exchange UI), which is dropped from
+   * tracking but NOT reported as a fill. Call once per tick.
+   *
+   * @param {string} symbol
+   * @returns {Promise<{ orderId: string, side: 'buy'|'sell', size: number, price: number, reduceOnly: boolean, pnl?: number }[]>}
+   */
+  async pollFilledOrders(symbol) {
+    const sym = await this._prep(symbol);
+    const tracked = this._gridOrders.get(sym) ?? [];
+    if (tracked.length === 0) return [];
+
+    const openOrders = await this.exchange.fetchOpenOrders(sym);
+    const openIds = new Set(openOrders.map((o) => o.id));
+
+    const filled = [];
+    const stillTracked = [];
+    for (const order of tracked) {
+      if (openIds.has(order.orderId)) { stillTracked.push(order); continue; }
+
+      let status;
+      try { status = await this.exchange.fetchOrder(order.orderId, sym); }
+      catch (e) {
+        console.warn(`CcxtAdapter(${this.venueName}): could not confirm status of grid order ${order.orderId}, dropping it from tracking: ${e.message}`);
+        continue; // drop it — better to lose track of one order than report a fill that may not have happened
+      }
+      if (status.status !== 'closed' && status.status !== 'filled') continue; // canceled/rejected/expired — not a fill
+
+      const fillPrice = status.average ?? status.price ?? order.price;
+      const result = { orderId: order.orderId, side: order.side, size: order.size, price: fillPrice, reduceOnly: order.reduceOnly };
+      if (order.reduceOnly) {
+        const direction = order.entryDirection === 'buy' ? 1 : -1;
+        result.pnl = (fillPrice - order.entryPrice) * order.size * direction;
+      }
+      filled.push(result);
+    }
+    this._gridOrders.set(sym, stillTracked);
+    return filled;
+  }
+
+  /** @returns {Promise<{ orderId: string, side: 'buy'|'sell', size: number, price: number, reduceOnly: boolean }[]>} currently resting, unfilled limit orders this adapter placed */
+  async getOpenOrders(symbol) {
+    const sym = await this._prep(symbol);
+    return (this._gridOrders.get(sym) ?? []).map(
+      ({ orderId, side, size, price, reduceOnly }) => ({ orderId, side, size, price, reduceOnly })
+    );
   }
 }
 

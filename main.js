@@ -6,13 +6,18 @@
  * or dry-run based on DRY_RUN), the Telegram bot, a health-check HTTP
  * server (for Render's health checks + UptimeRobot pings, since Render's
  * free tier spins a service down after 15 min with no inbound HTTP
- * traffic), and runs three independent scheduled jobs:
+ * traffic), and runs independent scheduled jobs:
  *
  *   1. Per-symbol engine cycle (runSymbolCycle) — every POLL_INTERVAL_MS,
  *      for each whitelisted symbol.
  *   2. Pump/dump scanner sweep — every SCAN_INTERVAL_MS, across the full
  *      symbol universe (not whitelist-restricted).
  *   3. Max holding period sweep — every HOLD_CHECK_INTERVAL_MS.
+ *   4. Grid bot (core/gridBot.js) — every GRID_POLL_INTERVAL_MS, off by
+ *      default (GRID_ENABLED). A different strategy from the SMC engine
+ *      above: trades continuously off price oscillation within a bounded
+ *      range, rather than waiting for structure+confluence to align —
+ *      see gridBot.js's header for the mechanics and its panic-stop.
  *
  * Not runnable inside this sandbox (no network to exchanges/Telegram/a
  * real DB), but every piece it wires together has been independently
@@ -46,6 +51,7 @@ const { scanMarket } = require('./scanner/scanner');
 const { DumpTradeManager } = require('./scanner/dumpTrader');
 const { processDumpExit } = require('./scanner/dumpExitMonitor');
 const { createDashboardHandler, BotControl } = require('./api/dashboardServer');
+const { GridBot } = require('./core/gridBot');
 
 const DRY_RUN = process.env.DRY_RUN !== 'false'; // default to dry-run/paper-trading for safety
 const BYBIT_DEMO = process.env.BYBIT_DEMO === 'true'; // Bybit Demo Trading: real prices, fake funds, real order flow
@@ -65,6 +71,22 @@ const SCAN_INTERVAL_MS = envNumber('SCAN_INTERVAL_MS', 5 * 60_000);
 const HOLD_CHECK_INTERVAL_MS = envNumber('HOLD_CHECK_INTERVAL_MS', 60 * 60_000);
 const PAPER_BALANCE = envNumber('PAPER_BALANCE', 10_000); // starting simulated balance per venue in DRY_RUN mode
 const SIGNAL_TIMEFRAME = process.env.SIGNAL_TIMEFRAME ?? '1h'; // candle interval the main engine reasons about
+
+// --- Grid bot (core/gridBot.js) — a neutral futures grid, independent of
+// the SMC engine above: trades continuously off price oscillation within
+// a bounded range instead of waiting for structure+confluence to align.
+// Off by default — this is a different strategy with a different risk
+// profile (see core/gridBot.js's header), not a drop-in replacement, so
+// it needs an explicit opt-in plus real bounds/sizing, not a guessed
+// default.
+const GRID_ENABLED = process.env.GRID_ENABLED === 'true';
+const GRID_SYMBOL = process.env.GRID_SYMBOL ?? 'BTCUSDT';
+const GRID_LOWER_BOUND = envNumber('GRID_LOWER_BOUND', null);
+const GRID_UPPER_BOUND = envNumber('GRID_UPPER_BOUND', null);
+const GRID_LEVELS = envNumber('GRID_LEVELS', 10);
+const GRID_CAPITAL_PER_LEVEL = envNumber('GRID_CAPITAL_PER_LEVEL', null);
+const GRID_STOP_BUFFER_PCT = envNumber('GRID_STOP_BUFFER_PCT', 0.1);
+const GRID_POLL_INTERVAL_MS = envNumber('GRID_POLL_INTERVAL_MS', 10_000); // much faster than POLL_INTERVAL_MS — grid fills are time-sensitive in a way SMC structure checks aren't
 const HTF_BIAS_ENABLED = process.env.HTF_BIAS_ENABLED !== 'false'; // daily+4H trend-agreement filter (htfBias.js) — was wired in engineCycle.js but never actually called with data until this fix
 // Per-setup dynamic by default: a high OB+live-orderbook probability setup
 // gets an aggressive entry, a weaker one needs LTF confirmation — decided
@@ -393,6 +415,108 @@ async function main() {
       holdingSweepRunning = false;
     }
   }, HOLD_CHECK_INTERVAL_MS);
+
+  // --- Job 4: grid bot — independent of Jobs 1-3 above, its own interval
+  // since grid fills are time-sensitive in a way the SMC engine's 60s
+  // structure checks aren't. Validates its own config at startup and
+  // logs/notifies clearly rather than silently not running, or crashing
+  // the whole process, if GRID_ENABLED is on but misconfigured.
+  if (GRID_ENABLED) {
+    if (GRID_LOWER_BOUND === null || GRID_UPPER_BOUND === null || GRID_CAPITAL_PER_LEVEL === null) {
+      console.error(
+        'GRID_ENABLED=true but GRID_LOWER_BOUND, GRID_UPPER_BOUND, and/or GRID_CAPITAL_PER_LEVEL are not set — ' +
+        'the grid bot will NOT start (there is no safe default for a price range or position size). Set all three and redeploy.'
+      );
+    } else {
+      let gridBot;
+      try {
+        gridBot = new GridBot(GRID_SYMBOL, {
+          lowerBound: GRID_LOWER_BOUND,
+          upperBound: GRID_UPPER_BOUND,
+          levels: GRID_LEVELS,
+          capitalPerLevel: GRID_CAPITAL_PER_LEVEL,
+          stopBufferPct: GRID_STOP_BUFFER_PCT,
+        });
+      } catch (err) {
+        console.error(`Grid bot config invalid, not starting: ${err.message}`);
+      }
+
+      if (gridBot) {
+        let gridRunning = false;
+        let gridInitialized = false;
+        let gridHaltNotified = false;
+
+        setInterval(async () => {
+          if (gridRunning) return;
+          gridRunning = true;
+          try {
+            let currentPrice;
+            try {
+              const ticker = await marketData.bybit.fetchTicker(toCcxtSymbol(GRID_SYMBOL));
+              currentPrice = ticker.last ?? ticker.close;
+            } catch (err) {
+              console.warn(`[grid] ${GRID_SYMBOL}: price fetch failed, skipping this tick: ${err.message}`);
+              return;
+            }
+            if (!currentPrice) return;
+
+            // Keep the DryRunAdapter's simulated price in sync with the
+            // real market when paper trading, so grid fills reflect real
+            // price movement. The real CcxtAdapter has no such method —
+            // its orders rest on the real exchange and fill on their own.
+            if (typeof adapters.bybit.setPrice === 'function') adapters.bybit.setPrice(GRID_SYMBOL, currentPrice);
+
+            if (!gridInitialized) {
+              await gridBot.initialize(adapters.bybit, currentPrice);
+              gridInitialized = true;
+              console.log(`[grid] ${GRID_SYMBOL} initialized: ${gridBot.levels} levels, [${GRID_LOWER_BOUND}, ${GRID_UPPER_BOUND}], $${GRID_CAPITAL_PER_LEVEL}/level`);
+              if (telegramBot) {
+                await telegramBot
+                  .notify(`🔲 Grid bot started on ${GRID_SYMBOL}: ${gridBot.levels} levels in [${GRID_LOWER_BOUND}, ${GRID_UPPER_BOUND}], $${GRID_CAPITAL_PER_LEVEL}/level, panic-stop at ±${(GRID_STOP_BUFFER_PCT * 100).toFixed(0)}% beyond bounds.`)
+                  .catch(() => {});
+              }
+              return;
+            }
+
+            const result = await gridBot.tick(adapters.bybit, currentPrice);
+
+            if (result.halted) {
+              if (!gridHaltNotified) {
+                gridHaltNotified = true;
+                console.error(`[grid] ${GRID_SYMBOL} HALTED: ${result.reason}`);
+                if (telegramBot) {
+                  await telegramBot
+                    .notify(`🛑 Grid bot on ${GRID_SYMBOL} HALTED (panic stop): ${result.reason}\nRealized P&L: ${gridBot.realizedPnl.toFixed(4)}, fills: ${gridBot.fillCount}.\nWill NOT auto-restart — restart the service with new bounds to resume.`)
+                    .catch(() => {});
+                }
+              }
+              return;
+            }
+
+            if (result.events && result.events.length > 0) {
+              for (const event of result.events) {
+                console.log(`[grid] ${GRID_SYMBOL} ${event.type}`, JSON.stringify(event));
+              }
+              if (telegramBot) {
+                const lines = result.events.map((e) =>
+                  e.type === 'opened'
+                    ? `Opened ${e.side} @ ${e.price} (size ${e.size.toFixed(6)})`
+                    : `Closed ${e.side} @ ${e.price}, pnl ${e.pnl?.toFixed(4)}`
+                );
+                await telegramBot
+                  .notify(`🔲 Grid ${GRID_SYMBOL}:\n${lines.join('\n')}\nTotal realized P&L: ${gridBot.realizedPnl.toFixed(4)} | fills: ${gridBot.fillCount}`)
+                  .catch(() => {});
+              }
+            }
+          } catch (err) {
+            console.error(`[grid] ${GRID_SYMBOL}: tick failed: ${err.message}`);
+          } finally {
+            gridRunning = false;
+          }
+        }, GRID_POLL_INTERVAL_MS);
+      }
+    }
+  }
 
   // --- Health server: satisfies Render's Web Service port requirement,
   // --- and gives UptimeRobot something to ping every 5 min to keep the
